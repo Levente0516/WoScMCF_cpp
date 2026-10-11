@@ -87,7 +87,7 @@ float sourceT(Vector3 cpz, const Surface& surface)
     
     float d2 = dx*dx + dy*dy + dz*dz;
     
-    float sigmaSource = 0.25f;
+    float sigmaSource = 0.05f;
 
     return std::exp(-d2 / (2.0f * sigmaSource * sigmaSource));
 }
@@ -628,6 +628,39 @@ mantis::AccelerationStructure buildAccel(const Surface& S)
     return mantis::AccelerationStructure(P, T);
 }
 
+
+std::vector<Vector3> calculateVertexNormals(const Surface& surface)
+{
+    std::vector<Vector3> normals(
+        surface.vertices.size(),
+        {0.0f, 0.0f, 0.0f}
+    );
+
+    for (const Triangle& t : surface.triangles)
+    {
+        Vector3 a = surface.vertices[t.v0].vert;
+        Vector3 b = surface.vertices[t.v1].vert;
+        Vector3 c = surface.vertices[t.v2].vert;
+
+        Vector3 n = Vector3CrossProduct(
+            Vector3Subtract(b, a),
+            Vector3Subtract(c, a)
+        );
+
+        normals[t.v0] = Vector3Add(normals[t.v0], n);
+        normals[t.v1] = Vector3Add(normals[t.v1], n);
+        normals[t.v2] = Vector3Add(normals[t.v2], n);
+    }
+
+    for (Vector3& n : normals)
+    {
+        if (Vector3Length(n) > 1e-8f)
+            n = Vector3Normalize(n);
+    }
+
+    return normals;
+}
+
 int main()
 {
     const int screenWidth = 1200;
@@ -681,6 +714,10 @@ int main()
     std::vector<float> uNew(N, 0.0f);
     std::vector<float> uVals(N, 0.0f);     
 
+    std::vector<Vector3> vertexNormals = calculateVertexNormals(surface);
+
+    float displacementScale = 0.25f;
+
     size_t nextVertex = 0;
     int pass = 0;
 
@@ -718,7 +755,7 @@ int main()
         {
             double t0 = GetTime();
 
-            while (nextVertex < N && GetTime() - t0 < 0.01)
+            while (nextVertex < N && GetTime() - t0 < 0.05f)
             {
                 Vector3 xi = surface.vertices[nextVertex].vert;
 
@@ -734,7 +771,7 @@ int main()
                 nextVertex++;
             }
 
-            if (nextVertex == N)            // egy teljes menet kész
+            if (nextVertex == N)        
             {
                 uPrev.swap(uNew);
 
@@ -786,25 +823,59 @@ int main()
             DrawSphere({center.x, center.y, center.z}, r, { 0, 121, 241, 128 });
         }
 
+        
         if (showU && calculationFinished)
         {
             for (const Triangle& t : surface.triangles)
             {
-                float uAvg = (uVals[t.v0] + uVals[t.v1] + uVals[t.v2]) / 3.0f;
-                float s = (uMax > uMin) ? (uAvg - uMin) / (uMax - uMin) : 0.5f;
-                Color col = ColorFromHSV((1.0f - s) * 240.0f, 0.9f, 1.0f);       
+                int i0 = t.v0;
+                int i1 = t.v1;
+                int i2 = t.v2;
 
-                Vector3 a = surface.vertices[t.v0].vert;
-                Vector3 b = surface.vertices[t.v1].vert;
-                Vector3 cc = surface.vertices[t.v2].vert;
+                Vector3 a = surface.vertices[i0].vert;
+                Vector3 b = surface.vertices[i1].vert;
+                Vector3 c = surface.vertices[i2].vert;
 
-                DrawTriangle3D({a.x, a.y, a.z}, {b.x, b.y, b.z}, {cc.x, cc.y, cc.z}, col);
+                auto normalizeU = [&](float u)
+                {
+                    return (uMax > uMin)
+                        ? (u - uMin) / (uMax - uMin)
+                        : 0.0f;
+                };
+
+                float u0 = normalizeU(uVals[i0]);
+                float u1 = normalizeU(uVals[i1]);
+                float u2 = normalizeU(uVals[i2]);
+
+                a = Vector3Add(
+                    a,
+                    Vector3Scale(vertexNormals[i0],
+                                displacementScale * u0)
+                );
+
+                b = Vector3Add(
+                    b,
+                    Vector3Scale(vertexNormals[i1],
+                                displacementScale * u1)
+                );
+
+                c = Vector3Add(
+                    c,
+                    Vector3Scale(vertexNormals[i2],
+                                displacementScale * u2)
+                );
+
+                float uAvg = (uVals[i0] + uVals[i1] + uVals[i2]) / 3.0f;
+                float s = normalizeU(uAvg);
+
+                Color col = ColorFromHSV(
+                    (1.0f - s) * 240.0f,
+                    0.9f,
+                    1.0f
+                );
+
+                DrawTriangle3D(a, b, c, col);
             }
-
-            /*
-            Vector3 sc = surface.vertices[1000].vert;
-            DrawSphere({sc.x, sc.y, sc.z}, 0.03f, BLACK);  
-            */
         }
                 
         EndMode3D();
