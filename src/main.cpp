@@ -3,12 +3,22 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <array>
+#include <tuple>
+#include <memory>
+#include <limits>
+#include <numeric>
+#include <stdexcept>
+#include <cstdint>
+#include <cstdio>
 #include <cmath>
 #include <algorithm>
+#include <random>
 #include "raylib.h"
 #include "raymath.h"
-#include <random>
 #include "mantis.h"
+
+#pragma region Structs
 
 struct Vertex{
     Vector3 vert;
@@ -35,6 +45,9 @@ struct Interp {
     float w[3];    
 };
 
+#pragma endregion
+
+#pragma region Random
 //generate the seed TODO: seed should be preprocessed
 static std::mt19937& rng()
 {
@@ -42,83 +55,32 @@ static std::mt19937& rng()
     return gen;
 }
 
-//generates a float between 2 numbers uniformly
-static float uni(float low, float high)
+//uniform number in [0, 1)
+static double uni01()
 {
-    static std::uniform_real_distribution<float> d(low, high);
+    static std::uniform_real_distribution<double> d(0.0, 1.0);
     return d(rng());
 }
 
-//Returns the distance between a point on the surface and its closest medial axis point
-float localFetureSize(const std::vector<Vector3>& M, Vector3 x)
+#pragma endregion
+
+#pragma region Sampling
+
+//uniform random direction on the unit sphere
+static Vector3 randomUnitVector()
 {
-    float minDistance = std::numeric_limits<float>::max();
+    double z   = 2.0 * uni01() - 1.0;
+    double phi = 2.0 * PI * uni01();
+    double s   = std::sqrt(std::max(0.0, 1.0 - z * z));
 
-    for (const Vector3& m : M)
-    {
-        float d2 = Vector3Distance(m, x);
-        minDistance = std::min(minDistance, d2);
-    }
-
-    //TODO: 0.25f should be lambda and be determined by somthing reather than just it beign a burnt in value, because it depends heavly on the size of the modell
-    return std::max(0.9f * minDistance, 0.25f);
+    return { (float)(s * std::cos(phi)), (float)(s * std::sin(phi)), (float)z };
 }
 
-
-float GreensFunc(Vector3 x, Vector3 z, float sigma, float R)
-{
-    float r_x = z.x - x.x;
-    float r_y = z.y - x.y;
-    float r_z = z.z - x.z;
-    float r = sqrt(pow(r_x,2) + pow(r_y,2) + pow(r_z,2));
-
-    float value = (1/(4 * PI)) * ((sinh((R-r) * sqrt(sigma)))/(r * sinh(R * sqrt(sigma))));
-
-    return value;
-}
-
-float sourceT(Vector3 cpz, const Surface& surface)
-{
-    Vector3 sourceCenter = surface.vertices[1000].vert;
-    
-    float dx = cpz.x - sourceCenter.x;
-    float dy = cpz.y - sourceCenter.y;
-    float dz = cpz.z - sourceCenter.z;
-    
-    float d2 = dx*dx + dy*dy + dz*dz;
-    
-    float sigmaSource = 0.05f;
-
-    return std::exp(-d2 / (2.0f * sigmaSource * sigmaSource));
-}
-
-float sampling(Vector3 x, Vector3 z)
-{
-    float r_x = x.x - z.x;
-    float r_y = x.y - z.y;
-    float r_z = x.z - z.z;
-    float r = sqrt(pow(r_x,2) + pow(r_y,2) + pow(r_z,2));
-
-    float value = 1/r;
-
-    return value;
-}
-
-//Samples a point on the gives sphere
+//Samples a point on the given sphere
 Vector3 samplePointOnSphere(Vector3 center, float r)
 {
-    float u = uni(0.0f, 1.0f);
-    float v = uni(0.0f, 1.0f);
-    float phi = 2 * PI * uni(0.0f, 1.0f);
-
-    float theta = acos(2*v - 1);
-
-    float x = center.x + r * sin(theta) * cos(phi);
-    float y = center.y + r * sin(theta) * sin(phi);
-    float z = center.z + r * cos(theta);
-
-    return {x, y, z};
-}   
+    return Vector3Add(center, Vector3Scale(randomUnitVector(), r));
+}
 
 //Samples multiple points inside a sphere
 std::vector<Vector3> samplePointsInsideSphere(Vector3 center, float r, int Ns)
@@ -128,26 +90,31 @@ std::vector<Vector3> samplePointsInsideSphere(Vector3 center, float r, int Ns)
 
     for (int i = 0; i < Ns; i++)
     {
-        Vector3 cords;
+        float radius = r * (float)std::cbrt(uni01());
 
-        float u = uni(0.0f, 1.0f);
-        float v = uni(0.0f, 1.0f);
-        float phi = 2 * PI * uni(0.0f, 1.0f);
-
-        float theta = acos(2*v - 1);
-
-        float radius = r * pow(u, (1.0f/3.0f));
-
-        cords.x = center.x + radius * sin(theta) * cos(phi);
-        cords.y = center.y + radius * sin(theta) * sin(phi);
-        cords.z = center.z + radius * cos(theta);
-
-        randomPoints.push_back(cords);
+        randomPoints.push_back(Vector3Add(center, Vector3Scale(randomUnitVector(), radius)));
     }
 
     return randomPoints;
 }
 
+#pragma endregion 
+
+//Distance-based local feature size from the medial axis point cloud
+//TODO: lfsMin should be determined by something rather than just being a burnt in value, because it depends heavily on the size of the model
+float localFetureSize(const std::vector<Vector3>& M, Vector3 x, float lfsMin)
+{
+    float minDistance2 = std::numeric_limits<float>::max();
+
+    for (const Vector3& m : M)
+    {
+        minDistance2 = std::min(minDistance2, Vector3DistanceSqr(m, x));
+    }
+
+    return std::max(0.9f * std::sqrt(minDistance2), lfsMin);
+}
+
+#pragma region Triangle methods
 //Turns Cartesian cordinates to Barycentric cords. while filtering out bad triangles
 Vector3 barycentric(const Surface& S, int tri, Vector3 p)
 {
@@ -175,12 +142,17 @@ Vector3 barycentric(const Surface& S, int tri, Vector3 p)
     return { bc.x / s, bc.y / s, bc.z / s };
 }
 
-//Interpolates a tirangles value based on its neighbours
-Interp closestInterp(const Surface& S, const mantis::AccelerationStructure& accel, Vector3 q)
+//Interpolation weights of the closest surface point to q (and optionally the closest point itself)
+Interp closestInterp(const Surface& S, const mantis::AccelerationStructure& accel, Vector3 q, Vector3* outPoint = nullptr)
 {
     mantis::Result r = accel.calc_closest_point(q.x, q.y, q.z);
 
     Vector3 p = { r.closest_point[0], r.closest_point[1], r.closest_point[2] };
+
+    if (outPoint) 
+    {
+        *outPoint = p;
+    }
 
     Interp I;
 
@@ -238,66 +210,40 @@ Interp closestInterp(const Surface& S, const mantis::AccelerationStructure& acce
     return I;
 }
 
+//Interp that sits exactly on vertex i
+Interp atVertex(int i)
+{
+    Interp I;
+
+    I.v[0] = I.v[1] = I.v[2] = i;
+
+    I.w[0] = 1.0f;
+    I.w[1] = 0.0f;
+    I.w[2] = 0.0f;
+
+    return I;
+}
+
+float interpScalar(const Interp& I, const std::vector<float>& f)
+{
+    return I.w[0] * f[I.v[0]] + I.w[1] * f[I.v[1]] + I.w[2] * f[I.v[2]];
+}
+
+Vector3 interpVec(const Interp& I, const std::vector<Vector3>& f)
+{
+    return Vector3Add(Vector3Add(Vector3Scale(f[I.v[0]], I.w[0]),
+                                 Vector3Scale(f[I.v[1]], I.w[1])),
+                                 Vector3Scale(f[I.v[2]], I.w[2]));
+}
+
+#pragma endregion
+
 //Returns the closest point on a surface from a another point
 Vector3 closestPointOnSurface(const mantis::AccelerationStructure& accel, Vector3 q)
 {
     mantis::Result r = accel.calc_closest_point(q.x, q.y, q.z);
 
     return { r.closest_point[0], r.closest_point[1], r.closest_point[2] };
-}
-
-//Filter usage
-float FilteredEstimate(const Surface& surface, const std::vector<Vector3>& M, int Nv, Vector3 x, const mantis::AccelerationStructure& accel, const std::vector<float>& uPrev)
-{
-    float r = localFetureSize(M, x);
-
-    float sigma = 5;
-
-    float c = sqrt(sigma) * r / std::sinh(sqrt(sigma) * r);
-
-    float u_hat_sphere = 0.0f;
-
-    float u = uni(0.0f, 1.0f);
-
-    if (u < c)
-    {
-        Vector3 y = samplePointOnSphere(x, r);
-
-        Interp I = closestInterp(surface, accel, y);
-
-        u_hat_sphere = I.w[0] * uPrev[I.v[0]] + I.w[1] * uPrev[I.v[1]] + I.w[2] * uPrev[I.v[2]];
-    }
-
-    std::vector<Vector3> z = samplePointsInsideSphere(x, r, Nv);
-
-    float u_hat_ball = 0.0f;
-
-    for (int i = 0; i < Nv; i++)
-    {
-        if (z[i].x == x.x && z[i].y == x.y && z[i].z == x.z)
-        {
-            continue;
-        }
-
-        u_hat_ball += (GreensFunc(x, z[i], sigma, r) * sourceT(closestPointOnSurface(accel, z[i]), surface)) / sampling(x, z[i]);
-    }
-
-    u_hat_ball /= Nv;
-
-    return u_hat_sphere + u_hat_ball;
-}
-
-//Filter usage
-float FilteredSolution(int Nw, int Nv, Vector3 x, const std::vector<Vector3>& M, const mantis::AccelerationStructure& accel, const Surface& surface, const std::vector<float>& uPrev)
-{
-    float sum = 0.0f;
-
-    for (int n = 0; n < Nw; n++)
-    {
-        sum += FilteredEstimate(surface, M, Nv, x, accel, uPrev);
-    }
-
-    return sum / Nw;
 }
 
 //Loads in the OBJ file provided
@@ -351,6 +297,8 @@ Surface loadOBJ(const std::string& filename)
     return surface;
 }
 
+#pragma region Medial axis
+
 //Implements the algorithm of Ma et. al.
 std::tuple<Vector3, float> MaEtAl(Vector3 n, float R, Vector3 p, const mantis::AccelerationStructure& accel)
 {
@@ -392,37 +340,39 @@ std::tuple<Vector3, float> MaEtAl(Vector3 n, float R, Vector3 p, const mantis::A
     return { c, r };
 }
 
-
-
 //Creates the Medial axis Point Cloud that will be used for how big of a sphere we should choose along the steps of a walk
-std::tuple<std::vector<Vector3>, Vector3, float> MedialAxisPointCloud(Model model, int Ns, const mantis::AccelerationStructure& accel)
+std::tuple<std::vector<Vector3>, Vector3, float> MedialAxisPointCloud(const Surface& surface, int Ns, const mantis::AccelerationStructure& accel)
 {
-    BoundingBox bb = GetModelBoundingBox(model);
+    Vector3 bbMin = surface.vertices[0].vert;
+    Vector3 bbMax = surface.vertices[0].vert;
 
-    Vector3 center = Vector3Scale(Vector3Add(bb.max, bb.min), 0.5f);
+    for (const Vertex& v : surface.vertices)
+    {
+        bbMin = Vector3Min(bbMin, v.vert);
+        bbMax = Vector3Max(bbMax, v.vert);
+    }
 
-    Vector3 bb_range = Vector3Subtract(bb.max, bb.min);
+    Vector3 center = Vector3Scale(Vector3Add(bbMax, bbMin), 0.5f);
+
+    Vector3 bb_range = Vector3Subtract(bbMax, bbMin);
 
     float r = Vector3Length(bb_range) / 2;
 
     std::vector<Vector3> medialBallPoints = samplePointsInsideSphere(center, r, Ns);
 
     std::vector<Vector3> medialAxisPoints;
-    medialAxisPoints.reserve(Ns);
+    medialAxisPoints.reserve(Ns * 2);
 
     std::vector<float> r_new;
-    r_new.reserve(Ns);
+    r_new.reserve(Ns * 2);
 
-    for (const Vector3 points : medialBallPoints)
+    for (const Vector3& points : medialBallPoints)
     {
-
         Vector3 p = closestPointOnSurface(accel, points);
 
         Vector3 pp = Vector3Subtract(points, p);
 
-        float magnitude = Vector3Length(pp);
-
-        Vector3 normal = Vector3Scale(pp, magnitude);
+        Vector3 normal = Vector3Normalize(pp);
 
         Vector3 normalInv = Vector3Scale(normal, -1);
 
@@ -469,7 +419,7 @@ std::tuple<std::vector<Vector3>, Vector3, float> MedialAxisPointCloud(Model mode
     }
 
     std::vector<Vector3> prunedPoints;
-    prunedPoints.reserve(Ns * 2 - removed.size());
+    prunedPoints.reserve(medialAxisPoints.size());
 
     for (size_t i = 0; i < medialAxisPoints.size(); ++i)
     {
@@ -482,57 +432,252 @@ std::tuple<std::vector<Vector3>, Vector3, float> MedialAxisPointCloud(Model mode
     return {prunedPoints, center, r};
 }
 
-float RecursiveEstimate(const Surface& surface, const std::vector<Vector3>& M, int Nv, Vector3 x, const mantis::AccelerationStructure& accel)
+#pragma endregion
+
+#pragma region Screened Poisson ball helpers
+
+//P(no collision inside the ball) = kappa / sinh(kappa), kappa = R * sqrt(sigmaBar)
+static double continueProb(double k)
 {
-    float r = localFetureSize(M,x);
-
-    float u_hat_sphere = 0.0f;
-    float sigma = 5;
-
-    float c = sqrt(sigma) * r / std::sinh(sqrt(sigma) * r);
-
-    float u = uni(0.0f, 1.0f);
-
-    if (u < c)
+    if (k < 1e-4)
     {
-        Vector3 y = samplePointOnSphere(x, r);
-        
-        u_hat_sphere = RecursiveEstimate(surface, M, Nv, closestPointOnSurface(accel, y), accel);
+        return 1.0 - k * k / 6.0;
     }
 
-    std::vector<Vector3> z = samplePointsInsideSphere(x, r, Nv);
-
-    float u_hat_ball = 0.0f;
-
-    for (int i = 0; i < Nv; i++)
-    {
-        if (z[i].x == x.x && z[i].y == x.y && z[i].z == x.z)
-        {
-            continue;
-        }
-
-        u_hat_ball += (GreensFunc(x,  z[i], sigma, r) * sourceT(closestPointOnSurface(accel, z[i]), surface))/sampling(x, z[i]);
-    }
-
-    u_hat_ball /= Nv;
-
-    return u_hat_sphere + u_hat_ball;
+    return 2.0 * k * std::exp(-k) / (1.0 - std::exp(-2.0 * k));
 }
 
-float EstimateSolution(int Np, int Nv, Vector3 x, int Ns, const std::vector<Vector3>& M, const mantis::AccelerationStructure& accel, const Surface& surface)
+//Radial density of G_sigma in the ball (t = r / R):  t * sinh(kappa (1 - t))
+static double radialDensity(double t, double k)
 {
-    float u_hat_sum = 0;
+    return t * (std::exp(-k * t) - std::exp(-k * (2.0 - t)));
+}
+
+//Maximum of the radial density: tanh(k (1 - t)) = k t
+static double radialDensityMax(double k)
+{
+    double lo = 0.0, hi = 1.0;
+
+    for (int i = 0; i < 40; ++i)
+    {
+        double mid = 0.5 * (lo + hi);
+
+        if (std::tanh(k * (1.0 - mid)) - k * mid > 0.0)
+        {
+            lo = mid;
+        }
+        else
+        {
+            hi = mid;
+        }
+    }
+
+    return radialDensity(0.5 * (lo + hi), k) * 1.0001;
+}
+
+//Samples y ~ G_sigmaBar(x, .) / int G in the ball of radius R around x (rejection sampling on the radius)
+//k = R * sqrt(sigmaBar), Mx = radialDensityMax(k)
+static Vector3 sampleScreenedBall(Vector3 x, float R, double k, double Mx)
+{
+    double t;
+
+    do 
+    { 
+        t = uni01(); 
+    } 
+    while (uni01() * Mx > radialDensity(t, k));
+
+    return Vector3Add(x, Vector3Scale(randomUnitVector(), (float)(t * R)));
+}
+
+#pragma endregion
+
+#pragma region Geometry helpers
+
+//Area belonging to every vertex (1/3 of each adjacent triangle) for the positions P
+std::vector<float> vertexAreas(const Surface& S, const std::vector<Vector3>& P)
+{
+    std::vector<float> A(S.vertices.size(), 0.0f);
+
+    for (const Triangle& t : S.triangles)
+    {
+        float a = 0.5f * Vector3Length(Vector3CrossProduct(Vector3Subtract(P[t.v1], P[t.v0]), Vector3Subtract(P[t.v2], P[t.v0]))) / 3.0f;
+
+        A[t.v0] += a;
+        A[t.v1] += a;
+        A[t.v2] += a;
+    }
+
+    return A;
+}
+
+//sigma_n = (1/delta) * dA_n / dA_0   per vertex  (A_0: areas of the surface the walks live on, A_n: areas of Phi^n)
+std::vector<float> computeSigma(const Surface& S, const std::vector<Vector3>& Phi, const std::vector<float>& A0, float delta)
+{
+    std::vector<float> An = vertexAreas(S, Phi);
+    std::vector<float> sigma(An.size());
+
+    for (size_t i = 0; i < sigma.size(); ++i)
+    {
+        sigma[i] = An[i] / (std::max(A0[i], 1e-12f) * delta);
+    }
+
+    return sigma;
+}
+
+//Isoperimetric quotient pi^(1/3) (6V)^(2/3) / A : 1 for a perfect sphere, smaller for everything else
+double sphericity(const Surface& S, const std::vector<Vector3>& P, double* areaOut = nullptr)
+{
+    double V = 0.0;
+    double A = 0.0;
+
+    for (const Triangle& t : S.triangles)
+    {
+        Vector3 a = P[t.v0], b = P[t.v1], c = P[t.v2];
+
+        V += Vector3DotProduct(a, Vector3CrossProduct(b, c)) / 6.0;
+        A += 0.5 * Vector3Length(Vector3CrossProduct(Vector3Subtract(b, a), Vector3Subtract(c, a)));
+    }
+
+    if (areaOut) 
+    {
+        *areaOut = A;
+    }
+
+    return std::cbrt((double)PI) * std::pow(6.0 * std::fabs(V), 2.0 / 3.0) / A;
+}
+
+//Moves the centroid to the origin and rescales so the total area is targetArea
+void normalizeGeometry(const Surface& S, std::vector<Vector3>& P, float targetArea)
+{
+    std::vector<float> A = vertexAreas(S, P);
+
+    double total = 0.0;
+    Vector3 c = { 0.0f, 0.0f, 0.0f };
+
+    for (size_t i = 0; i < P.size(); ++i)
+    {
+        total += A[i];
+        c = Vector3Add(c, Vector3Scale(P[i], A[i]));
+    }
+
+    c = Vector3Scale(c, (float)(1.0 / total));
+
+    float s = (float)std::sqrt(targetArea / total);
+
+    for (Vector3& p : P)
+    {
+        p = Vector3Scale(Vector3Subtract(p, c), s);
+    }
+}
+
+#pragma endregion
+
+#pragma region cMCF estimators
+
+//Low sample estimate: ONE walk (with null collisions) that starts at vertex 'start', returns Phi^n(Y) at the end point Y
+Vector3 WalkEstimate(int start, const Surface& surface, const mantis::AccelerationStructure& accel, const std::vector<float>& lfs, const std::vector<Vector3>& Phi, const std::vector<float>& sigma, float sigmaBar)
+{
+    const int maxWalkSteps = 10000;
+
+    Vector3 x = surface.vertices[start].vert;
+    Interp Ix = atVertex(start);
+
+    for (int step = 0; step < maxWalkSteps; ++step)
+    {
+        float R = interpScalar(Ix, lfs); //feature size at x
+        double k = std::sqrt((double)sigmaBar) * R;
+
+        if (uni01() < continueProb(k))
+        {
+            //no collision in the ball: uniform point on the sphere, projected back to the surface
+            Vector3 y = samplePointOnSphere(x, R);
+            Vector3 p;
+
+            Ix = closestInterp(surface, accel, y, &p);
+            x  = p;
+        }
+
+        else
+        {
+            //collision in the ball: y ~ G, evaluated at its projection onto the surface
+            Vector3 y = sampleScreenedBall(x, R, k, radialDensityMax(k));
+            Vector3 p;
+
+            Interp Iy = closestInterp(surface, accel, y, &p);
+
+            if (uni01() < interpScalar(Iy, sigma) / sigmaBar)
+            {
+                return interpVec(Iy, Phi);                 //real collision: Phi^n(Y)
+            }
+
+            x  = p;                                        //null collision: continue from y
+            Ix = Iy;
+        }
+    }
+
+    return interpVec(Ix, Phi);                             //safety net, should (almost) never happen
+}
+
+Vector3 EstimateSolution(int Np, int start, const Surface& surface, const mantis::AccelerationStructure& accel, const std::vector<float>& lfs, const std::vector<Vector3>& Phi, const std::vector<float>& sigma, float sigmaBar)
+{
+    Vector3 sum = { 0.0f, 0.0f, 0.0f };
 
     for (int n = 0; n < Np; n++)
     {
-        float u_hat = RecursiveEstimate(surface, M, Nv, x, accel);
-        
-        u_hat_sum += u_hat;
+        sum = Vector3Add(sum, WalkEstimate(start, surface, accel, lfs, Phi, sigma, sigmaBar));
     }
-    
-    return u_hat_sum/Np;
+
+    return Vector3Scale(sum, 1.0f / (float)Np);
 }
 
+//Filtered estimate at vertex i: ONE step, the rest comes from the interpolated previous estimate uPrev
+Vector3 FilteredEstimate(int i, int Nv, const Surface& surface, const mantis::AccelerationStructure& accel, const std::vector<float>& lfs, const std::vector<Vector3>& Phi, const std::vector<float>& sigma, float sigmaBar, const std::vector<Vector3>& uPrev)
+{
+    Vector3 x = surface.vertices[i].vert;
+    float R = lfs[i];
+
+    double k = std::sqrt((double)sigmaBar) * R;
+    double Mx = radialDensityMax(k);
+    double c = continueProb(k);
+
+    //sphere term:  c * u_prev(z),  z uniform on the sphere
+    Interp Iz = closestInterp(surface, accel, samplePointOnSphere(x, R));
+
+    Vector3 sphereTerm = Vector3Scale(interpVec(Iz, uPrev), (float)c);
+
+    //ball term:  (1 - c) * mean over y ~ G of  [ p Phi^n(y) + (1 - p) u_prev(y) ],   p = sigma_n(y) / sigmaBar
+    Vector3 ball = { 0.0f, 0.0f, 0.0f };
+
+    for (int j = 0; j < Nv; ++j)
+    {
+        Interp Iy = closestInterp(surface, accel, sampleScreenedBall(x, R, k, Mx));
+
+        float p = std::clamp(interpScalar(Iy, sigma) / sigmaBar, 0.0f, 1.0f);
+
+        Vector3 val = Vector3Add(Vector3Scale(interpVec(Iy, Phi),   p), Vector3Scale(interpVec(Iy, uPrev), 1.0f - p));
+
+        ball = Vector3Add(ball, val);
+    }
+
+    ball = Vector3Scale(ball, (float)((1.0 - c) / Nv));
+
+    return Vector3Add(sphereTerm, ball);
+}
+
+Vector3 FilteredSolution(int Nw, int Nv, int i, const Surface& surface, const mantis::AccelerationStructure& accel, const std::vector<float>& lfs, const std::vector<Vector3>& Phi, const std::vector<float>& sigma, float sigmaBar, const std::vector<Vector3>& uPrev)
+{
+    Vector3 sum = { 0.0f, 0.0f, 0.0f };
+
+    for (int n = 0; n < Nw; n++)
+    {
+        sum = Vector3Add(sum, FilteredEstimate(i, Nv, surface, accel, lfs, Phi, sigma, sigmaBar, uPrev));
+    }
+
+    return Vector3Scale(sum, 1.0f / (float)Nw);
+}
+
+#pragma endregion
 
 Model buildModel(const std::string& filename)
 {
@@ -543,16 +688,34 @@ Model buildModel(const std::string& filename)
     std::ifstream file(filename);
     if (!file) throw std::runtime_error("Could not open file");
     std::string line;
-    while (std::getline(file, line)) {
+    while (std::getline(file, line)) 
+    {
         std::stringstream ss(line); std::string type; ss >> type;
-        if (type == "v")  { Vector3 p; ss >> p.x >> p.y >> p.z; pos.push_back(p); }
-        else if (type == "vt") { Vector2 t; ss >> t.x >> t.y; uv.push_back(t); }
-        else if (type == "vn") { Vector3 n; ss >> n.x >> n.y >> n.z; nrm.push_back(n); }
-        else if (type == "f") {
-            for (int i = 0; i < 3; i++) {
+        if (type == "v")  
+        { 
+            Vector3 p; 
+            ss >> p.x >> p.y >> p.z; 
+            pos.push_back(p); 
+        }
+        else if (type == "vt") 
+        { 
+            Vector2 t; 
+            ss >> t.x >> t.y; 
+            uv.push_back(t); 
+        }
+        else if (type == "vn") 
+        { 
+            Vector3 n; 
+            ss >> n.x >> n.y >> n.z; 
+            nrm.push_back(n); 
+        }
+        else if (type == "f") 
+        {
+            for (int i = 0; i < 3; i++) 
+            {
                 std::string tok; ss >> tok;
                 int v = 0, t = 0, n = 0;
-                sscanf(tok.c_str(), "%d/%d/%d", &v, &t, &n); // "v//vn" gives t=0 -> handle below
+                sscanf(tok.c_str(), "%d/%d/%d", &v, &t, &n);
                 corners.push_back({ v - 1, t - 1, n - 1 });
             }
         }
@@ -565,11 +728,22 @@ Model buildModel(const std::string& filename)
     mesh.texcoords = (float*)MemAlloc(mesh.vertexCount * 2 * sizeof(float));
     mesh.normals   = (float*)MemAlloc(mesh.vertexCount * 3 * sizeof(float));
 
-    for (int i = 0; i < mesh.vertexCount; i++) {
+    for (int i = 0; i < mesh.vertexCount; i++) 
+    {
         const Corner& c = corners[i];
         mesh.vertices[3*i+0] = pos[c.v].x; mesh.vertices[3*i+1] = pos[c.v].y; mesh.vertices[3*i+2] = pos[c.v].z;
-        if (c.t >= 0 && c.t < (int)uv.size()) { mesh.texcoords[2*i] = uv[c.t].x; mesh.texcoords[2*i+1] = 1.0f - uv[c.t].y; }
-        if (c.n >= 0 && c.n < (int)nrm.size()) { mesh.normals[3*i] = nrm[c.n].x; mesh.normals[3*i+1] = nrm[c.n].y; mesh.normals[3*i+2] = nrm[c.n].z; }
+        if (c.t >= 0 && c.t < (int)uv.size()) 
+        { 
+            mesh.texcoords[2*i] = uv[c.t].x;
+            mesh.texcoords[2*i+1] = 1.0f - uv[c.t].y; 
+        }
+
+        if (c.n >= 0 && c.n < (int)nrm.size()) 
+        { 
+            mesh.normals[3*i] = nrm[c.n].x; 
+            mesh.normals[3*i+1] = nrm[c.n].y; 
+            mesh.normals[3*i+2] = nrm[c.n].z; 
+        }
     }
 
     UploadMesh(&mesh, false);
@@ -588,7 +762,7 @@ void updateOrbit(Camera3D& cam, OrbitCam& o)
     }
 
     o.dist *= 1.0f - GetMouseWheelMove() * 0.1f;
-    o.dist = std::clamp(o.dist, 0.2f, 100.0f);
+    o.dist = std::clamp(o.dist, 0.2f, 300.0f);
 
     cam.position = Vector3Add(o.target, {
         o.dist * cosf(o.pitch) * sinf(o.yaw),
@@ -609,7 +783,7 @@ void updateOrbit(Camera3D& cam, OrbitCam& o)
     }
 }
 
-mantis::AccelerationStructure buildAccel(const Surface& S)
+std::unique_ptr<mantis::AccelerationStructure> buildAccel(const Surface& S)
 {
     std::vector<std::array<float, 3>> P; 
     P.reserve(S.vertices.size());
@@ -625,40 +799,7 @@ mantis::AccelerationStructure buildAccel(const Surface& S)
         T.push_back({ (uint32_t)t.v0, (uint32_t)t.v1, (uint32_t)t.v2 });
     }
 
-    return mantis::AccelerationStructure(P, T);
-}
-
-
-std::vector<Vector3> calculateVertexNormals(const Surface& surface)
-{
-    std::vector<Vector3> normals(
-        surface.vertices.size(),
-        {0.0f, 0.0f, 0.0f}
-    );
-
-    for (const Triangle& t : surface.triangles)
-    {
-        Vector3 a = surface.vertices[t.v0].vert;
-        Vector3 b = surface.vertices[t.v1].vert;
-        Vector3 c = surface.vertices[t.v2].vert;
-
-        Vector3 n = Vector3CrossProduct(
-            Vector3Subtract(b, a),
-            Vector3Subtract(c, a)
-        );
-
-        normals[t.v0] = Vector3Add(normals[t.v0], n);
-        normals[t.v1] = Vector3Add(normals[t.v1], n);
-        normals[t.v2] = Vector3Add(normals[t.v2], n);
-    }
-
-    for (Vector3& n : normals)
-    {
-        if (Vector3Length(n) > 1e-8f)
-            n = Vector3Normalize(n);
-    }
-
-    return normals;
+    return std::make_unique<mantis::AccelerationStructure>(P, T);
 }
 
 int main()
@@ -666,15 +807,21 @@ int main()
     const int screenWidth = 1200;
     const int screenHeight = 800;
 
-    const int Np_low = 1;     // kezdőbecslés: régi módszer, kevés minta
-    const int Nw     = 32;    // szűrőlépésenként ennyi minta csúcsonként
-    const int K      = 5;     // szűrőlépések száma
-    int Nv = 16;
-    int Ns = 10000;
+    const int Ns = 20000; //medial axis points
+    const float lfsMin = 10.0f; //localFetureSize lower bound TODO: should be based on the model
 
-    //unsigned int seed = 123;
+    //flow
+    const float delta = 0.01f; // time step of one iteration: kappa = R * sqrt(sigmaBar) = R * sqrt(max(dA_n/dA_0) / delta)
+    const int numIterations = 40; // how many times the geometry is moved
 
-    Surface surface = loadOBJ("testModels/spot/spot/spot_triangulated.obj");
+    //estimator
+    const int Np_low = 20; // pass 0: low sample estimate
+    const int Nw = 30; // filter passes per vertex
+    const int K = 3; // number of filter passes
+    const int Nv = 5; // ball samples per filtered estimate
+
+    Surface surface = loadOBJ("testModels/armadillo/armadillo.obj");
+    //Surface surface = loadOBJ("testModels/spot/spot/spot_triangulated.obj");
 
     InitWindow(screenWidth, screenHeight, "WoScMFC");
 
@@ -686,46 +833,83 @@ int main()
     camera.fovy = 45.0f;
     camera.projection = CAMERA_PERSPECTIVE;
 
-    Model model = buildModel("testModels/spot/spot/spot_triangulated.obj");
+    Model model = buildModel("testModels/armadillo/armadillo.obj");
 
-    Texture2D texture = LoadTexture("testModels/spot/spot/spot_texture.png");
+    //Texture2D texture = LoadTexture("testModels/spot/spot/spot_texture.png");
 
-    model.materials[0].maps[MATERIAL_MAP_DIFFUSE].texture = texture;
+    //model.materials[0].maps[MATERIAL_MAP_DIFFUSE].texture = texture;
 
     SetTargetFPS(60);
 
-    mantis::AccelerationStructure accel = buildAccel(surface);
-
-    auto [M, center, r] = MedialAxisPointCloud(model, Ns, accel);
-
     OrbitCam orbit;
-
-    Vector3 bb_min = surface.vertices[0].vert;
-    Vector3 bb_max = surface.vertices[0].vert;
 
     static bool wires = false;
     static bool bb = false;
     static bool mPAC = false;
-    static bool showU = false;
+    static bool flowOn = false;
 
     const size_t N = surface.vertices.size();
 
-    std::vector<float> uPrev(N, 0.0f);
-    std::vector<float> uNew(N, 0.0f);
-    std::vector<float> uVals(N, 0.0f);     
+    std::vector<Vector3> P_orig(N);
+    
+    for (size_t i = 0; i < N; ++i)
+    {
+        P_orig[i] = surface.vertices[i].vert;
+    }
 
-    std::vector<Vector3> vertexNormals = calculateVertexNormals(surface);
+    const std::vector<float> A_orig = vertexAreas(surface, P_orig);
 
-    float displacementScale = 0.25f;
+    const float targetArea = std::accumulate(A_orig.begin(), A_orig.end(), 0.0f);
 
-    size_t nextVertex = 0;
+    std::unique_ptr<mantis::AccelerationStructure> accel;
+    std::vector<Vector3> M;
+    Vector3 bsCenter = { 0.0f, 0.0f, 0.0f };
+    float bsRadius = 1.0f;
+    std::vector<float> lfs(N);             
+    float meanLfs = 0.0f;
+    std::vector<float> A0;                  
+    std::vector<Vector3> Phi;               
+
+    //(re)builds everything that depends on the geometry: surface, acceleration structure, medial axis, feature size, areas
+    auto rebuildBase = [&](const std::vector<Vector3>& positions)
+    {
+        for (size_t i = 0; i < N; ++i)
+        {
+            surface.vertices[i].vert = positions[i];
+        }
+
+        accel = buildAccel(surface);
+
+        auto res = MedialAxisPointCloud(surface, Ns, *accel);
+
+        M = std::get<0>(res);
+        bsCenter = std::get<1>(res);
+        bsRadius = std::get<2>(res);
+
+        for (size_t i = 0; i < N; ++i)
+        {
+            lfs[i] = localFetureSize(M, positions[i], lfsMin);
+        }
+
+        meanLfs = std::accumulate(lfs.begin(), lfs.end(), 0.0f) / (float)N;
+
+        A0  = vertexAreas(surface, positions);
+        Phi = positions;
+    };
+
+    rebuildBase(P_orig);
+
+    std::vector<Vector3> uPrev(N); 
+    std::vector<Vector3> uNew(N);
+    std::vector<Vector3> pendingPositions;
+    std::vector<float> sigma;
+
+    float sigmaBar = 0.0f;
+    bool sigmaReady = false;
+    bool needRebuild = false;
+    int iteration = 0;
     int pass = 0;
-
-    float uMin = 1e30f;
-    float uMax = -1e30f;
-
-    bool calculationFinished = false;
-
+    size_t nextVertex  = 0;
 
     while (!WindowShouldClose())
     {
@@ -745,27 +929,42 @@ int main()
         {
             mPAC = !mPAC; 
         }
-
-        if (IsKeyPressed(KEY_U))
+        if (IsKeyPressed(KEY_SPACE))
         {
-            showU = !showU;
+            flowOn = !flowOn;         
+        }
+        if (IsKeyPressed(KEY_R))
+        {
+            flowOn = false;
+            rebuildBase(P_orig);
+            iteration = 0;
+            pass = 0;
+            nextVertex = 0;
+            sigmaReady = false;
+            needRebuild = false;
         }
 
-        if (showU && !calculationFinished)
+        if (flowOn && iteration < numIterations)
         {
+            //start of an iteration: sigma_n and sigmaBar
+            if (!sigmaReady)
+            {
+                sigma = computeSigma(surface, Phi, A0, delta);
+                sigmaBar = *std::max_element(sigma.begin(), sigma.end());
+                sigmaReady = true;
+            }
+
             double t0 = GetTime();
 
-            while (nextVertex < N && GetTime() - t0 < 0.05f)
+            while (nextVertex < N && GetTime() - t0 < 0.05)
             {
-                Vector3 xi = surface.vertices[nextVertex].vert;
-
                 if (pass == 0)
                 {
-                    uNew[nextVertex] = EstimateSolution(Np_low, Nv, xi, Ns, M, accel, surface);
+                    uNew[nextVertex] = EstimateSolution(Np_low, (int)nextVertex, surface, *accel, lfs, Phi, sigma, sigmaBar);
                 }
                 else
                 {
-                    uNew[nextVertex] = FilteredSolution(Nw, Nv, xi, M, accel, surface, uPrev);
+                    uNew[nextVertex] = FilteredSolution(Nw, Nv, (int)nextVertex, surface, *accel, lfs, Phi, sigma, sigmaBar, uPrev);
                 }
 
                 nextVertex++;
@@ -781,11 +980,16 @@ int main()
 
                 if (pass > K)
                 {
-                    uVals = uPrev;
-                    auto [mn, mx] = std::minmax_element(uVals.begin(), uVals.end());
-                    uMin = *mn;
-                    uMax = *mx;
-                    calculationFinished = true;
+                    //iteration finished: uPrev = Phi^{n+1}, move the geometry
+                    std::vector<Vector3> newPos = uPrev;
+
+                    normalizeGeometry(surface, newPos, targetArea);                    
+
+                    Phi = newPos;
+
+                    iteration++;
+                    pass = 0;
+                    sigmaReady = false;
                 }
             }
         }
@@ -796,7 +1000,9 @@ int main()
 
         BeginMode3D(camera);
 
-        if (!showU)
+        bool showPhi = flowOn || iteration > 0;
+
+        if (!showPhi)
         {
             if (wires) 
             {
@@ -807,11 +1013,40 @@ int main()
                 DrawModel(model, { 0.0f, 0.0f, 0.0f }, 1.0f, WHITE);
             }
         }
+        else
+        {
+            //the current shape Phi, simple headlight shading
+            Vector3 toCam = Vector3Normalize(Vector3Subtract(camera.position, camera.target));
 
-        //Medial point axis cloud
+            for (const Triangle& t : surface.triangles)
+            {
+                Vector3 a = Phi[t.v0];
+                Vector3 b = Phi[t.v1];
+                Vector3 c = Phi[t.v2];
+
+                if (wires)
+                {
+                    DrawLine3D(a, b, DARKGRAY);
+                    DrawLine3D(b, c, DARKGRAY);
+                    DrawLine3D(c, a, DARKGRAY);
+                }
+                else
+                {
+                    Vector3 n = Vector3Normalize(Vector3CrossProduct(Vector3Subtract(b, a), Vector3Subtract(c, a)));
+
+                    float shade = 0.3f + 0.7f * std::max(0.0f, Vector3DotProduct(n, toCam));
+
+                    Color col = { (unsigned char)(120.0f * shade), (unsigned char)(170.0f * shade), (unsigned char)(230.0f * shade), 255 };
+
+                    DrawTriangle3D(a, b, c, col);
+                }
+            }
+        }
+
+        //Medial point axis cloud (of the surface the walks currently live on)
         if (mPAC)
         {
-            for (const Vector3 m : M)
+            for (const Vector3& m : M)
             {
                 DrawSphere({m.x, m.y, m.z}, 0.01, RED);
             }
@@ -820,75 +1055,34 @@ int main()
         //boundingbox
         if (bb)
         {
-            DrawSphere({center.x, center.y, center.z}, r, { 0, 121, 241, 128 });
-        }
-
-        
-        if (showU && calculationFinished)
-        {
-            for (const Triangle& t : surface.triangles)
-            {
-                int i0 = t.v0;
-                int i1 = t.v1;
-                int i2 = t.v2;
-
-                Vector3 a = surface.vertices[i0].vert;
-                Vector3 b = surface.vertices[i1].vert;
-                Vector3 c = surface.vertices[i2].vert;
-
-                auto normalizeU = [&](float u)
-                {
-                    return (uMax > uMin)
-                        ? (u - uMin) / (uMax - uMin)
-                        : 0.0f;
-                };
-
-                float u0 = normalizeU(uVals[i0]);
-                float u1 = normalizeU(uVals[i1]);
-                float u2 = normalizeU(uVals[i2]);
-
-                a = Vector3Add(
-                    a,
-                    Vector3Scale(vertexNormals[i0],
-                                displacementScale * u0)
-                );
-
-                b = Vector3Add(
-                    b,
-                    Vector3Scale(vertexNormals[i1],
-                                displacementScale * u1)
-                );
-
-                c = Vector3Add(
-                    c,
-                    Vector3Scale(vertexNormals[i2],
-                                displacementScale * u2)
-                );
-
-                float uAvg = (uVals[i0] + uVals[i1] + uVals[i2]) / 3.0f;
-                float s = normalizeU(uAvg);
-
-                Color col = ColorFromHSV(
-                    (1.0f - s) * 240.0f,
-                    0.9f,
-                    1.0f
-                );
-
-                DrawTriangle3D(a, b, c, col);
-            }
+            DrawSphere({bsCenter.x, bsCenter.y, bsCenter.z}, bsRadius, { 0, 121, 241, 128 });
         }
                 
         EndMode3D();
 
-        if (showU && !calculationFinished)
+        if (showPhi)
         {
-            DrawText(TextFormat("pass %d / %d  (%d / %d vertices)", pass, K, (int)nextVertex, (int)N), 20, 20, 20, DARKGRAY);
+            double area = 0.0;
+            double sph = sphericity(surface, Phi, &area);
+
+            DrawText(TextFormat("iteration %d / %d   pass %d / %d   (%d / %d vertices)", iteration, numIterations, pass, K, (int)nextVertex, (int)N), 20, 20, 20, DARKGRAY);
+
+            if (sigmaBar > 0.0f)
+            {
+                double kMean = std::sqrt((double)sigmaBar) * meanLfs;
+
+                DrawText(TextFormat("sigmaBar = %.1f   kappa(mean R) = %.2f", sigmaBar, kMean), 20, 46, 20, DARKGRAY);
+            }
+
+            DrawText(TextFormat("area = %.3f   sphericity = %.4f  (sphere = 1)", area, sph), 20, 72, 20, DARKGRAY);
         }
+
+        DrawText("Space: start/pause   R: reset   W: wires   P: medial axis   B: bounding sphere", 20, screenHeight - 30, 18, GRAY);
 
         EndDrawing();
     }
 
-    UnloadTexture(texture);
+    //UnloadTexture(texture);
     UnloadModel(model);
 
     CloseWindow();
