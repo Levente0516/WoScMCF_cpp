@@ -1,0 +1,52 @@
+//spot
+
+experiments = {
+    r"$\delta$ = 5e-03": "runs/actual_good_tests/spot_test_1/metrics.csv",
+    r"$\delta$ = 1e-03": "runs/actual_good_tests/spot_test_3/metrics.csv",
+    r"$\delta$ = 5e-04": "runs/actual_good_tests/spot_test_2/metrics.csv",
+    r"$\delta$ = 1e-04": "runs/actual_good_tests/spot_test_4/metrics.csv"
+}
+
+//bunny
+
+experiments = {
+    r"$\delta$ = 5e-03": "runs/actual_good_tests/bunny_stein_test2/metrics.csv",
+    r"$\delta$ = 1e-03": "runs/actual_good_tests/bunny_stein_test1/metrics.csv",
+    r"$\delta$ = 5e-04": "runs/actual_good_tests/bunny_stein_test3/metrics.csv",
+    r"$\delta$ = 1e-04": "runs/actual_good_tests/bunny_stein_test4/metrics.csv",
+    r"$\delta$ = 5e-05": "runs/actual_good_tests/bunny_stein_test5/metrics.csv"
+}
+
+//reapired spot
+
+experiments = {
+    r"$\delta$ = 5e-03": "runs/actual_good_tests/spot_test_1_r/metrics.csv",
+    r"$\delta$ = 1e-03": "runs/actual_good_tests/spot_test_3_r/metrics.csv",
+    r"$\delta$ = 5e-04": "runs/actual_good_tests/spot_test_2_r/metrics.csv",
+    r"$\delta$ = 1e-04": "runs/actual_good_tests/spot_test_4_r/metrics.csv"
+}
+
+//filter test spot
+
+experiments = {
+    "K = 1": "runs/actual_good_tests/spot_test_K_1/metrics.csv",
+    "K = 2": "runs/actual_good_tests/spot_test_K_2/metrics.csv",
+    "K = 3": "runs/actual_good_tests/spot_test_K_3/metrics.csv",
+    "K = 4": "runs/actual_good_tests/spot_test_K_4/metrics.csv"
+}
+
+//lfs min test spot
+
+experiments = {
+    "lfsMin = 0.99": "runs/actual_good_tests/spot_test_lfs_1/metrics.csv",
+    "lfsMin = 0.5": "runs/actual_good_tests/spot_test_lfs_2/metrics.csv",
+    "lfsMin = 0.09": "runs/actual_good_tests/spot_test_lfs_3/metrics.csv",
+    "lfsMin = 0.05": "runs/actual_good_tests/spot_test_lfs_4/metrics.csv",
+    "lfsMin = 0.009": "runs/actual_good_tests/spot_test_lfs_5/metrics.csv"
+}
+
+//spot cycle
+
+experiments = {
+    "cycle": "runs/actual_good_tests/spot_test_cycle/metrics.csv"
+}

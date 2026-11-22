@@ -17,6 +17,11 @@
 #include "raylib.h"
 #include "raymath.h"
 #include "mantis.h"
+#include <chrono>
+#include <ctime>
+#include <filesystem>
+#include "memusage.h"
+#include "frames_io.h"
 
 #pragma region Structs
 
@@ -56,10 +61,16 @@ static std::mt19937& rng()
 }
 
 //uniform number in [0, 1)
+//antithetic (mirrored) sampling: a pair of walks uses the same random numbers but opposite directions,
+//so the first order (tangential) part of the noise cancels and only the second order part (the signal) is left
+static std::mt19937* g_gen = nullptr;     //generator used by uni01 (nullptr = the global one)
+static float g_dirSign = 1.0f;            //+1 / -1: sign of every sampled direction
+static bool g_antithetic = true;          //--noanti switches it off
+
 static double uni01()
 {
     static std::uniform_real_distribution<double> d(0.0, 1.0);
-    return d(rng());
+    return d(g_gen ? *g_gen : rng());
 }
 
 #pragma endregion
@@ -73,7 +84,7 @@ static Vector3 randomUnitVector()
     double phi = 2.0 * PI * uni01();
     double s   = std::sqrt(std::max(0.0, 1.0 - z * z));
 
-    return { (float)(s * std::cos(phi)), (float)(s * std::sin(phi)), (float)z };
+    return { g_dirSign * (float)(s * std::cos(phi)), g_dirSign * (float)(s * std::sin(phi)), g_dirSign * (float)z };
 }
 
 //Samples a point on the given sphere
@@ -114,6 +125,17 @@ float localFetureSize(const std::vector<Vector3>& M, Vector3 x, float lfsMin)
     return std::max(0.9f * std::sqrt(minDistance2), lfsMin);
 }
 
+#pragma region Statistics counters
+
+//global counters for the log, reset at the start of every iteration (the solver is single threaded)
+static unsigned long long g_cpQueries   = 0;   //closest point queries of the walks and the filter
+static unsigned long long g_walks       = 0;   //walks started in pass 0
+static unsigned long long g_walkSteps   = 0;   //balls (steps) visited by those walks
+static unsigned long long g_cappedWalks = 0;   //walks that hit the step limit
+static int kMaxWalkSteps = 4096;                 //--maxSteps=N. Must be large: the walks that start in collapsed regions (sigma ~ 0) are long
+
+#pragma endregion
+
 #pragma region Triangle methods
 //Turns Cartesian cordinates to Barycentric cords. while filtering out bad triangles
 Vector3 barycentric(const Surface& S, int tri, Vector3 p)
@@ -145,6 +167,8 @@ Vector3 barycentric(const Surface& S, int tri, Vector3 p)
 //Interpolation weights of the closest surface point to q (and optionally the closest point itself)
 Interp closestInterp(const Surface& S, const mantis::AccelerationStructure& accel, Vector3 q, Vector3* outPoint = nullptr)
 {
+    ++g_cpQueries;
+
     mantis::Result r = accel.calc_closest_point(q.x, q.y, q.z);
 
     Vector3 p = { r.closest_point[0], r.closest_point[1], r.closest_point[2] };
@@ -578,13 +602,15 @@ void normalizeGeometry(const Surface& S, std::vector<Vector3>& P, float targetAr
 //Low sample estimate: ONE walk (with null collisions) that starts at vertex 'start', returns Phi^n(Y) at the end point Y
 Vector3 WalkEstimate(int start, const Surface& surface, const mantis::AccelerationStructure& accel, const std::vector<float>& lfs, const std::vector<Vector3>& Phi, const std::vector<float>& sigma, float sigmaBar)
 {
-    const int maxWalkSteps = 10000;
+    ++g_walks;
 
     Vector3 x = surface.vertices[start].vert;
     Interp Ix = atVertex(start);
 
-    for (int step = 0; step < maxWalkSteps; ++step)
+    for (int step = 0; step < kMaxWalkSteps; ++step)
     {
+        ++g_walkSteps;
+
         float R = interpScalar(Ix, lfs); //feature size at x
         double k = std::sqrt((double)sigmaBar) * R;
 
@@ -606,7 +632,9 @@ Vector3 WalkEstimate(int start, const Surface& surface, const mantis::Accelerati
 
             Interp Iy = closestInterp(surface, accel, y, &p);
 
-            if (uni01() < interpScalar(Iy, sigma) / sigmaBar)
+            float acceptance = interpScalar(Iy, sigma) / sigmaBar;
+
+            if (uni01() < acceptance)
             {
                 return interpVec(Iy, Phi);                 //real collision: Phi^n(Y)
             }
@@ -616,12 +644,39 @@ Vector3 WalkEstimate(int start, const Surface& surface, const mantis::Accelerati
         }
     }
 
+    ++g_cappedWalks;
+
     return interpVec(Ix, Phi);                             //safety net, should (almost) never happen
 }
 
 Vector3 EstimateSolution(int Np, int start, const Surface& surface, const mantis::AccelerationStructure& accel, const std::vector<float>& lfs, const std::vector<Vector3>& Phi, const std::vector<float>& sigma, float sigmaBar)
 {
     Vector3 sum = { 0.0f, 0.0f, 0.0f };
+
+    if (g_antithetic)
+    {
+        //mirrored pairs: same random numbers, opposite directions
+        const int pairs = std::max(1, Np / 2);
+
+        for (int n = 0; n < pairs; n++)
+        {
+            std::mt19937 genA(rng()());
+            std::mt19937 genB = genA;
+
+            g_gen = &genA; 
+            g_dirSign =  1.0f;
+            sum = Vector3Add(sum, WalkEstimate(start, surface, accel, lfs, Phi, sigma, sigmaBar));
+
+            g_gen = &genB; 
+            g_dirSign = -1.0f;
+            sum = Vector3Add(sum, WalkEstimate(start, surface, accel, lfs, Phi, sigma, sigmaBar));
+
+            g_gen = nullptr; 
+            g_dirSign = 1.0f;
+        }
+
+        return Vector3Scale(sum, 1.0f / (float)(2 * pairs));
+    }
 
     for (int n = 0; n < Np; n++)
     {
@@ -669,6 +724,28 @@ Vector3 FilteredSolution(int Nw, int Nv, int i, const Surface& surface, const ma
 {
     Vector3 sum = { 0.0f, 0.0f, 0.0f };
 
+    if (g_antithetic)
+    {
+        //mirrored pairs: same random numbers, opposite directions
+        const int pairs = std::max(1, Nw / 2);
+
+        for (int n = 0; n < pairs; n++)
+        {
+            std::mt19937 genA(rng()());
+            std::mt19937 genB = genA;
+
+            g_gen = &genA; g_dirSign =  1.0f;
+            sum = Vector3Add(sum, FilteredEstimate(i, Nv, surface, accel, lfs, Phi, sigma, sigmaBar, uPrev));
+
+            g_gen = &genB; g_dirSign = -1.0f;
+            sum = Vector3Add(sum, FilteredEstimate(i, Nv, surface, accel, lfs, Phi, sigma, sigmaBar, uPrev));
+
+            g_gen = nullptr; g_dirSign = 1.0f;
+        }
+
+        return Vector3Scale(sum, 1.0f / (float)(2 * pairs));
+    }
+
     for (int n = 0; n < Nw; n++)
     {
         sum = Vector3Add(sum, FilteredEstimate(i, Nv, surface, accel, lfs, Phi, sigma, sigmaBar, uPrev));
@@ -676,6 +753,175 @@ Vector3 FilteredSolution(int Nw, int Nv, int i, const Surface& surface, const ma
 
     return Vector3Scale(sum, 1.0f / (float)Nw);
 }
+
+#pragma endregion
+
+#pragma region Run logging
+
+#include "error_metric.inc"
+
+struct SigmaStats
+{
+    double bar = 0.0, avg = 0.0, med = 0.0, min = 0.0;
+};
+
+struct MeshQuality
+{
+    double minAreaRatio;   //min over triangles of area(Phi) / area(S0)   (small = collapsed triangle)
+    double minAngleDeg;    //smallest triangle angle of Phi
+};
+
+MeshQuality meshQuality(const Surface& S, const std::vector<Vector3>& P, const std::vector<double>& triArea0)
+{
+    double minRatio = std::numeric_limits<double>::max();
+    double minAngle = (double)PI;
+
+    for (size_t t = 0; t < S.triangles.size(); ++t)
+    {
+        const Triangle& tr = S.triangles[t];
+        const int idx[3] = { tr.v0, tr.v1, tr.v2 };
+
+        for (int k = 0; k < 3; ++k)
+        {
+            const Vector3 o = P[idx[k]];
+            const Vector3 u = Vector3Subtract(P[idx[(k + 1) % 3]], o);
+            const Vector3 v = Vector3Subtract(P[idx[(k + 2) % 3]], o);
+
+            const double c = Vector3Length(Vector3CrossProduct(u, v));
+            const double d = Vector3DotProduct(u, v);
+
+            minAngle = std::min(minAngle, std::atan2(c, d));
+
+            if (k == 0 && triArea0[t] > 1e-20)
+            {
+                minRatio = std::min(minRatio, 0.5 * c / triArea0[t]);
+            }
+        }
+    }
+
+    return { minRatio, minAngle * 180.0 / (double)PI };
+}
+
+//RMS vertex displacement between two shapes / bounding box diagonal of the new one
+double relRmsDisplacement(const std::vector<Vector3>& a, const std::vector<Vector3>& b)
+{
+    double d2 = 0.0;
+    Vector3 bmin = b[0], bmax = b[0];
+
+    for (size_t i = 0; i < b.size(); ++i)
+    {
+        const double d = Vector3Distance(a[i], b[i]);
+
+        d2 += d * d;
+        bmin = Vector3Min(bmin, b[i]);
+        bmax = Vector3Max(bmax, b[i]);
+    }
+
+    return std::sqrt(d2 / b.size()) / std::max((double)Vector3Distance(bmin, bmax), 1e-30);
+}
+
+//one row of metrics.csv. NaN = not available -> empty cell
+struct IterRecord
+{
+    int iter = 0;
+    double sphericity = std::nan(""), area = std::nan("");
+    double sigmaBar = std::nan(""), sigmaAvg = std::nan(""), sigmaMed = std::nan(""), sigmaMin = std::nan("");
+    double errRelDisp = std::nan(""), errRelBBox = std::nan(""), errMaxBBox = std::nan("");
+    double avgWalkSteps = std::nan(""), cappedFrac = std::nan(""), cpQueries = std::nan("");
+    double timeSec = std::nan(""), rssMB = std::nan(""), peakMB = std::nan("");
+    double rmsDispRel = std::nan(""), minAreaRatio = std::nan(""), minAngleDeg = std::nan("");
+};
+
+struct RunLog
+{
+    std::string dir;
+    std::ofstream metrics;
+    int saveEvery = 1;
+    bool saveObj = false;
+    std::vector<int> faces;
+
+    bool begin(const std::string& root, const std::string& name, int saveEveryIter, bool objToo, const std::vector<std::pair<std::string, std::string>>& params, const Surface& S)
+    {
+        namespace fs = std::filesystem;
+
+        dir = root + "/" + name;
+        saveEvery = std::max(1, saveEveryIter);
+        saveObj = objToo;
+
+        fs::create_directories(dir + "/frames");
+
+        faces.clear();
+
+        for (const Triangle& t : S.triangles)
+        {
+            faces.push_back(t.v0);
+            faces.push_back(t.v1);
+            faces.push_back(t.v2);
+        }
+
+        writeFacesCsv(dir + "/faces.csv", faces);
+
+        std::ofstream p(dir + "/params.txt");
+
+        for (const auto& kv : params)
+        {
+            p << kv.first << "=" << kv.second << "\n";
+        }
+
+        if (metrics.is_open())
+        {
+            metrics.close();
+        }
+
+        metrics.open(dir + "/metrics.csv");
+
+        metrics << "iter,sphericity,area,sigma_bar,sigma_avg,sigma_med,sigma_min,"
+                   "err_rel_disp,err_rel_bbox,err_max_bbox,avg_walk_steps,capped_frac,cp_queries,"
+                   "time_sec,rss_mb,peak_rss_mb,rms_disp_rel,min_area_ratio,min_angle_deg\n";
+
+        return metrics.good();
+    }
+
+    static std::string cell(double v)
+    {
+        if (std::isnan(v))
+        {
+            return "";
+        }
+
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "%.10g", v);
+
+        return buf;
+    }
+
+    void writeRow(const IterRecord& r)
+    {
+        metrics << r.iter << ',' << cell(r.sphericity) << ',' << cell(r.area) << ','
+                << cell(r.sigmaBar) << ',' << cell(r.sigmaAvg) << ',' << cell(r.sigmaMed) << ',' << cell(r.sigmaMin) << ','
+                << cell(r.errRelDisp) << ',' << cell(r.errRelBBox) << ',' << cell(r.errMaxBBox) << ','
+                << cell(r.avgWalkSteps) << ',' << cell(r.cappedFrac) << ',' << cell(r.cpQueries) << ','
+                << cell(r.timeSec) << ',' << cell(r.rssMB) << ',' << cell(r.peakMB) << ','
+                << cell(r.rmsDispRel) << ',' << cell(r.minAreaRatio) << ',' << cell(r.minAngleDeg) << '\n';
+
+        metrics.flush();
+    }
+
+    void writeFrame(int iter, const std::vector<Vector3>& P, bool force)
+    {
+        if (!force && iter % saveEvery != 0)
+        {
+            return;
+        }
+
+        writeFrameCsv(framePath(dir, iter, "csv"), P);
+
+        if (saveObj)
+        {
+            writeFrameObj(framePath(dir, iter, "obj"), P, faces);
+        }
+    }
+};
 
 #pragma endregion
 
@@ -762,7 +1008,7 @@ void updateOrbit(Camera3D& cam, OrbitCam& o)
     }
 
     o.dist *= 1.0f - GetMouseWheelMove() * 0.1f;
-    o.dist = std::clamp(o.dist, 0.2f, 300.0f);
+    o.dist = std::clamp(o.dist, 0.2f, 600.0f);
 
     cam.position = Vector3Add(o.target, {
         o.dist * cosf(o.pitch) * sinf(o.yaw),
@@ -802,28 +1048,137 @@ std::unique_ptr<mantis::AccelerationStructure> buildAccel(const Surface& S)
     return std::make_unique<mantis::AccelerationStructure>(P, T);
 }
 
-int main()
+//Reads a "x,y,z" (or "x;y;z") file with one header line, one vertex per line
+static bool readFrameCsvSimple(const std::string& path, std::vector<Vector3>& P)
 {
+    std::ifstream f(path);
+
+    if (!f)
+    {
+        return false;
+    }
+
+    std::string line;
+    std::getline(f, line);                               //header
+
+    while (std::getline(f, line))
+    {
+        for (char& ch : line)
+        {
+            if (ch == ';' || ch == ',')
+            {
+                ch = ' ';
+            }
+        }
+
+        std::stringstream ss(line);
+        Vector3 v;
+
+        if (ss >> v.x >> v.y >> v.z)
+        {
+            P.push_back(v);
+        }
+    }
+
+    return true;
+}
+
+int main(int argc, char** argv)
+{
+    //command line (all optional):
+    //  --headless  no window, runs all iterations and exits (clean timing, no rendering)
+    //  --init=FILE  start from a saved state (frames/pos_XXXX.csv) instead of the original shape
+    //  --deltas=a,b,c  time step schedule, repeated cyclically (overrides --delta), e.g. --deltas=5e-3,5e-4,5e-5,5e-6
+    //  --model=PATH --delta=X --lfsMin=X --iters=N --Ns=N --Np=N --Nw=N --K=N --Nv=N --maxSteps=N --noanti
+    //  --out=NAME  run folder name   --outdir=DIR (default runs)   --saveEvery=N  --obj  --noref  --nolog
+    auto hasFlag = [&](const char* f)
+    {
+        for (int i = 1; i < argc; ++i)
+        {
+            if (std::string(argv[i]) == f)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    };
+
+    auto argVal = [&](const std::string& key, const std::string& def)
+    {
+        const std::string pre = "--" + key + "=";
+
+        for (int i = 1; i < argc; ++i)
+        {
+            const std::string a = argv[i];
+
+            if (a.rfind(pre, 0) == 0)
+            {
+                return a.substr(pre.size());
+            }
+        }
+
+        return def;
+    };
+
+    const bool headless = hasFlag("--headless");
+
     const int screenWidth = 1200;
     const int screenHeight = 800;
 
-    const int Ns = 20000; //medial axis points
-    const float lfsMin = 10.0f; //localFetureSize lower bound TODO: should be based on the model
+    const int Ns = std::stoi(argVal("Ns", "30000")); //medial axis points
+    const float lfsMin = std::stof(argVal("lfsMin", "0.01")); //localFetureSize lower bound
 
     //flow
-    const float delta = 0.01f; // time step of one iteration: kappa = R * sqrt(sigmaBar) = R * sqrt(max(dA_n/dA_0) / delta)
-    const int numIterations = 40; // how many times the geometry is moved
+    const float delta = std::stof(argVal("delta", "0.0005")); // time step of one iteration: kappa = R * sqrt(sigmaBar) = R * sqrt(max(dA_n/dA_0) / delta)
+    const int numIterations = std::stoi(argVal("iters", "300")); // how many times the geometry is moved
+
+    //time step schedule: --deltas=a,b,c,...  iteration n uses the (n mod length)-th value (default: always delta)
+    //one big step moves the shape, the smaller ones after it smooth away the noise the big step left on the small triangles
+    std::vector<float> deltaCycle;
+    {
+        std::stringstream ds(argVal("deltas", ""));
+        std::string tok;
+
+        while (std::getline(ds, tok, ','))
+        {
+            if (!tok.empty())
+            {
+                deltaCycle.push_back(std::stof(tok));
+            }
+        }
+
+        if (deltaCycle.empty())
+        {
+            deltaCycle.push_back(delta);
+        }
+    }
+
+    float curDelta = deltaCycle[0]; // time step of the current iteration
 
     //estimator
-    const int Np_low = 20; // pass 0: low sample estimate
-    const int Nw = 30; // filter passes per vertex
-    const int K = 3; // number of filter passes
-    const int Nv = 5; // ball samples per filtered estimate
+    const int Np_low = std::stoi(argVal("Np", "50")); // pass 0: low sample estimate
+    const int Nw = std::stoi(argVal("Nw", "50")); // filter passes per vertex
+    const int K = std::stoi(argVal("K", "3")); // number of filter passes
+    const int Nv = std::stoi(argVal("Nv", "5")); // ball samples per filtered estimate
 
-    Surface surface = loadOBJ("testModels/armadillo/armadillo.obj");
-    //Surface surface = loadOBJ("testModels/spot/spot/spot_triangulated.obj");
+    g_antithetic = !hasFlag("--noanti"); // mirrored walk pairs (variance reduction)
+    kMaxWalkSteps = std::stoi(argVal("maxSteps", "4096")); // step limit of one walk
 
-    InitWindow(screenWidth, screenHeight, "WoScMFC");
+    //Surface surface = loadOBJ("testModels/armadillo/armadillo.obj");
+    //Surface surface = loadOBJ("testModels/spot/spot/spot_triangulated.obj"); lfsMin = 0.25, delta = 1 * 10^-4
+    //Surface surface = loadOBJ("testModels/Meshes/ducky.obj");
+    //Surface surface = loadOBJ("testModels/venus.obj");
+    const std::string modelPath = argVal("model", "testModels/bunny.obj"); // lfsMin = 0.01, delta = 1 * 10^-4
+    Surface surface = loadOBJ(modelPath);
+    //Surface surface = loadOBJ("testModels/bone.obj");
+    //Surface surface = loadOBJ("testModels/angel_quadwild.obj");
+
+
+    if (!headless)
+    {
+        InitWindow(screenWidth, screenHeight, "WoScMFC");
+    }
 
     Camera3D camera = { 0 };
 
@@ -833,20 +1188,29 @@ int main()
     camera.fovy = 45.0f;
     camera.projection = CAMERA_PERSPECTIVE;
 
-    Model model = buildModel("testModels/armadillo/armadillo.obj");
+    //Model model = buildModel("testModels/armadillo/armadillo.obj");
+    //Model model = buildModel("testModels/spot/spot/spot_triangulated.obj");
+    //Model model = buildModel("testModels/Meshes/ducky.obj");
+    //Model model = buildModel("testModels/venus.obj");
+    Model model = { 0 };
+    Texture2D texture = { 0 };
 
-    //Texture2D texture = LoadTexture("testModels/spot/spot/spot_texture.png");
-
-    //model.materials[0].maps[MATERIAL_MAP_DIFFUSE].texture = texture;
-
-    SetTargetFPS(60);
+    if (!headless)
+    {
+        model = buildModel(modelPath);
+        texture = LoadTexture("testModels/spot/spot/spot_texture.png");
+        model.materials[0].maps[MATERIAL_MAP_DIFFUSE].texture = texture;
+        SetTargetFPS(60);
+    }
+    //Model model = buildModel("testModels/bone.obj"); 
+    //Model model = buildModel("testModels/angel_quadwild.obj");
 
     OrbitCam orbit;
 
     static bool wires = false;
     static bool bb = false;
     static bool mPAC = false;
-    static bool flowOn = false;
+    static bool flowOn = headless;
 
     const size_t N = surface.vertices.size();
 
@@ -899,6 +1263,32 @@ int main()
 
     rebuildBase(P_orig);
 
+    //--init=FILE: start the flow from a saved state (a frames/pos_XXXX.csv file) instead of the original shape.
+    //The walks still live on the original surface, only Phi^0 is replaced
+    const std::string initPath = argVal("init", "");
+
+    if (!initPath.empty())
+    {
+        std::vector<Vector3> P0;
+
+        if (!readFrameCsvSimple(initPath, P0))
+        {
+            std::cerr << "--init: could not open " << initPath << std::endl;
+            return 1;
+        }
+
+        if (P0.size() != N)
+        {
+            std::cerr << "--init: " << initPath << " has " << P0.size() << " vertices, the model has " << N << std::endl;
+            return 1;
+        }
+
+        Phi = P0;
+        std::cout << "starting from " << initPath << std::endl;
+    }
+
+    std::cout << N << std::endl; 
+
     std::vector<Vector3> uPrev(N); 
     std::vector<Vector3> uNew(N);
     std::vector<Vector3> pendingPositions;
@@ -911,8 +1301,159 @@ int main()
     int pass = 0;
     size_t nextVertex  = 0;
 
-    while (!WindowShouldClose())
+    //----------------------------------------------------------------------------------------------
+    //logging: <outdir>/<run>/metrics.csv, params.txt, faces.csv, frames/pos_XXXX.csv
+    //----------------------------------------------------------------------------------------------
+    const bool logEnabled = !hasFlag("--nolog");
+    const bool computeError = !hasFlag("--noref");
+    const std::string outRoot = argVal("outdir", "runs");
+    const int saveEvery = std::stoi(argVal("saveEvery", "1"));
+    const bool saveObj = hasFlag("--obj");
+    const double sliceSec = headless ? 1e30 : 0.05;   //time budget per frame for the solver
+
+    auto secondsSince = [](std::chrono::steady_clock::time_point t0)
     {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    };
+
+    CotanOp cotan;
+
+    if (computeError)
+    {
+        cotan = buildCotanOp(surface, P_orig);
+    }
+
+    std::vector<double> triArea0(surface.triangles.size());
+
+    for (size_t t = 0; t < triArea0.size(); ++t)
+    {
+        const Triangle& tr = surface.triangles[t];
+
+        triArea0[t] = 0.5 * Vector3Length(Vector3CrossProduct(Vector3Subtract(P_orig[tr.v1], P_orig[tr.v0]), Vector3Subtract(P_orig[tr.v2], P_orig[tr.v0])));
+    }
+
+    char stamp[32];
+    {
+        std::time_t now = std::time(nullptr);
+        std::strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", std::localtime(&now));
+    }
+
+    RunLog runLog;
+    int runCounter = 0;
+    SigmaStats sigStat;
+    double iterSec = 0.0;      //solver time of the current iteration (sigma + all passes, without rendering / error metric / logging)
+    bool finished = false;
+
+    auto beginRun = [&]()
+    {
+        if (!logEnabled)
+        {
+            return;
+        }
+
+        char dbuf[32];
+        std::snprintf(dbuf, sizeof(dbuf), "%g", (double)delta);
+
+        std::string name = argVal("out", "");
+
+        if (name.empty())
+        {
+            name = std::filesystem::path(modelPath).stem().string() + "_d" + dbuf + "_" + stamp;
+        }
+
+        if (runCounter > 0)
+        {
+            name += "_r" + std::to_string(runCounter + 1);
+        }
+
+        ++runCounter;
+
+        const std::vector<std::pair<std::string, std::string>> params =
+        {
+            { "model", modelPath },
+            { "vertices", std::to_string(N) },
+            { "triangles", std::to_string(surface.triangles.size()) },
+            { "delta", dbuf },
+            { "deltas", argVal("deltas", "") },
+            { "init", initPath },
+            { "lfsMin", std::to_string(lfsMin) },
+            { "Ns", std::to_string(Ns) },
+            { "iterations", std::to_string(numIterations) },
+            { "Np_low", std::to_string(Np_low) },
+            { "Nw", std::to_string(Nw) },
+            { "K", std::to_string(K) },
+            { "Nv", std::to_string(Nv) },
+            { "maxWalkSteps", std::to_string(kMaxWalkSteps) },
+            { "seed", "123" },
+            { "headless", headless ? "1" : "0" },
+            { "error_metric", computeError ? "1" : "0" },
+            { "saveEvery", std::to_string(saveEvery) },
+            { "baseline_rss_mb", std::to_string(currentRssMB()) },
+            { "build", std::string(__DATE__) + " " + __TIME__ }
+        };
+
+        runLog.begin(outRoot, name, saveEvery, saveObj, params, surface);
+
+        std::cout << "logging to " << runLog.dir << std::endl;
+
+        //row 0: the initial shape
+        IterRecord r0;
+        r0.iter = 0;
+        r0.sphericity = sphericity(surface, P_orig, &r0.area);
+        r0.rssMB = currentRssMB();
+        r0.peakMB = peakRssMB();
+
+        MeshQuality q0 = meshQuality(surface, P_orig, triArea0);
+        r0.minAreaRatio = q0.minAreaRatio;
+        r0.minAngleDeg = q0.minAngleDeg;
+
+        runLog.writeRow(r0);
+        runLog.writeFrame(0, P_orig, true);
+    };
+
+    //row of one finished iteration (iteration is already incremented, Phi = Phi^{iteration})
+    auto recordIteration = [&](const StepError& err, double rmsDisp)
+    {
+        if (!logEnabled)
+        {
+            return;
+        }
+
+        IterRecord r;
+        r.iter = iteration;
+        r.sphericity = sphericity(surface, Phi, &r.area);
+        r.sigmaBar = sigStat.bar;
+        r.sigmaAvg = sigStat.avg;
+        r.sigmaMed = sigStat.med;
+        r.sigmaMin = sigStat.min;
+        r.errRelDisp = err.relDisp;
+        r.errRelBBox = err.relBBox;
+        r.errMaxBBox = err.maxBBox;
+        r.avgWalkSteps = g_walks ? (double)g_walkSteps / (double)g_walks : std::nan("");
+        r.cappedFrac = g_walks ? (double)g_cappedWalks / (double)g_walks : std::nan("");
+        r.cpQueries = (double)g_cpQueries;
+        r.timeSec = iterSec;
+        r.rssMB = currentRssMB();
+        r.peakMB = peakRssMB();
+        r.rmsDispRel = rmsDisp;
+
+        MeshQuality q = meshQuality(surface, Phi, triArea0);
+        r.minAreaRatio = q.minAreaRatio;
+        r.minAngleDeg = q.minAngleDeg;
+
+        runLog.writeRow(r);
+        runLog.writeFrame(iteration, Phi, iteration == numIterations);
+
+        std::printf("iter %d/%d  time %.2fs  sph %.4f  sigBar %.3g  steps/walk %.2f  err %.3g  rss %.0f MB\n",
+                    iteration, numIterations, iterSec, r.sphericity, r.sigmaBar, r.avgWalkSteps, r.errRelBBox, r.rssMB);
+    };
+
+    beginRun();
+
+    while (headless ? !finished : !WindowShouldClose())
+    {
+        if (!headless)
+        {
         UpdateCamera(&camera, CAMERA_CUSTOM);
 
         updateOrbit(camera, orbit);
@@ -942,22 +1483,39 @@ int main()
             nextVertex = 0;
             sigmaReady = false;
             needRebuild = false;
+            iterSec = 0.0;
+            beginRun();
         }
+        } //end of if (!headless)
 
         if (flowOn && iteration < numIterations)
         {
+            const auto tC0 = std::chrono::steady_clock::now();
+
             //start of an iteration: sigma_n and sigmaBar
             if (!sigmaReady)
             {
-                sigma = computeSigma(surface, Phi, A0, delta);
+                curDelta = deltaCycle[(size_t)iteration % deltaCycle.size()];
+                sigma = computeSigma(surface, Phi, A0, curDelta);
                 sigmaBar = *std::max_element(sigma.begin(), sigma.end());
                 sigmaReady = true;
+
+                std::vector<float> s = sigma; 
+                std::sort(s.begin(), s.end());
+
+                sigStat.bar = sigmaBar;
+                sigStat.min = s[0];
+                sigStat.med = s[N / 2];
+                sigStat.avg = std::accumulate(sigma.begin(), sigma.end(), 0.0) / (double)N;
+
+                g_cpQueries = g_walks = g_walkSteps = g_cappedWalks = 0;
             }
 
-            double t0 = GetTime();
 
-            while (nextVertex < N && GetTime() - t0 < 0.05)
+
+            while (nextVertex < N && secondsSince(tC0) < sliceSec)
             {
+                
                 if (pass == 0)
                 {
                     uNew[nextVertex] = EstimateSolution(Np_low, (int)nextVertex, surface, *accel, lfs, Phi, sigma, sigmaBar);
@@ -969,6 +1527,8 @@ int main()
 
                 nextVertex++;
             }
+
+            iterSec += secondsSince(tC0);
 
             if (nextVertex == N)        
             {
@@ -983,15 +1543,40 @@ int main()
                     //iteration finished: uPrev = Phi^{n+1}, move the geometry
                     std::vector<Vector3> newPos = uPrev;
 
+                    //error metric: Monte Carlo step vs deterministic cotan reference (not counted in the solver time)
+                    StepError err = { std::nan(""), std::nan(""), std::nan("") };
+
+                    if (computeError)
+                    {
+                        std::vector<float> An = vertexAreas(surface, Phi);
+
+                        err = stepError(uPrev, referenceStep(cotan, An, Phi, curDelta), Phi);
+                    }
+
                     normalizeGeometry(surface, newPos, targetArea);                    
+
+                    const double rmsDisp = relRmsDisplacement(Phi, newPos);
 
                     Phi = newPos;
 
                     iteration++;
+
+                    recordIteration(err, rmsDisp);
+                    iterSec = 0.0;
                     pass = 0;
                     sigmaReady = false;
                 }
             }
+        }
+
+        if (headless)
+        {
+            if (iteration >= numIterations)
+            {
+                finished = true;
+            }
+
+            continue;
         }
 
         BeginDrawing();
@@ -1075,6 +1660,7 @@ int main()
             }
 
             DrawText(TextFormat("area = %.3f   sphericity = %.4f  (sphere = 1)", area, sph), 20, 72, 20, DARKGRAY);
+            DrawText(TextFormat("log: %s", runLog.dir.c_str()), 20, 98, 18, GRAY);
         }
 
         DrawText("Space: start/pause   R: reset   W: wires   P: medial axis   B: bounding sphere", 20, screenHeight - 30, 18, GRAY);
@@ -1082,10 +1668,13 @@ int main()
         EndDrawing();
     }
 
-    //UnloadTexture(texture);
-    UnloadModel(model);
+    if (!headless)
+    {
+        UnloadTexture(texture);
+        UnloadModel(model);
 
-    CloseWindow();
+        CloseWindow();
+    }
 
     return 0;
 }

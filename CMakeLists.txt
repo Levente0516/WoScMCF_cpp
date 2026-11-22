@@ -8,8 +8,10 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 find_package(raylib REQUIRED)
 
+# --- solver -----------------------------------------------------------------
 add_executable(WoScMCF
     src/main.cpp
+    src/memusage.cpp
     mantis/mantis.cpp
     mantis/Delaunay_psm.cpp
 )
@@ -22,3 +24,12 @@ set_source_files_properties(
 
 target_include_directories(WoScMCF PRIVATE mantis)
 target_link_libraries(WoScMCF PRIVATE raylib)
+
+if(WIN32)
+    target_link_libraries(WoScMCF PRIVATE psapi)   # GetProcessMemoryInfo (memusage.cpp)
+endif()
+
+# --- animation player ---------------------------------------------------------
+add_executable(WoScPlayer src/player.cpp)
+target_link_libraries(WoScPlayer PRIVATE raylib)
+target_include_directories(WoScMCF PRIVATE mantis src)
